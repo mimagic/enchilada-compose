@@ -1,0 +1,43 @@
+Enchilada — Proprietary Source-Available License
+Copyright (c) 2026 MiMagic GmbH. All rights reserved.
+
+"Software" means the Enchilada source code and all accompanying files in this
+repository. "MiMagic" means MiMagic GmbH.
+
+The Software is proprietary and confidential. It is made available in source
+form so that you can inspect it and run it. It is NOT open-source software and
+no open-source license is granted.
+
+1. Grant. Subject to this license, MiMagic grants you a non-exclusive,
+   non-transferable, royalty-free right to install and run the Software for
+   your own internal use (including self-hosting it for your organization),
+   and to modify it for that purpose.
+
+2. Restrictions. Without a separate written agreement with MiMagic, you may
+   not:
+   (a) redistribute, sublicense, sell, rent, or otherwise make the Software
+       (modified or not) available to any third party;
+   (b) offer the Software, or any service whose primary value derives from the
+       Software, to third parties as a hosted or managed service;
+   (c) remove or alter any copyright, trademark, or license notice.
+
+3. Ownership. MiMagic retains all right, title, and interest in the Software.
+   This license grants you no rights other than those expressly stated.
+
+4. Trademarks. "Enchilada", "Cantina", and "MiMagic" are
+   trademarks of MiMagic GmbH. This license grants no trademark rights.
+
+5. No warranty. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT. IN
+   NO EVENT SHALL MIMAGIC BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+   WHETHER IN CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN
+   CONNECTION WITH THE SOFTWARE OR ITS USE.
+
+6. Future licensing. MiMagic may, at its sole discretion, release the Software
+   or any part of it under different terms (including an open-source license)
+   in the future. Any such release applies only to the versions MiMagic
+   expressly designates.
+
+For commercial terms — redistribution, OEM, managed-service, or any rights
+beyond this license — contact MiMagic GmbH: https://getenchilada.com

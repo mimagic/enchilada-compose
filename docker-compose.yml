@@ -1,0 +1,350 @@
+# Enchilada — Self-host stack (docker compose)
+# ============================================================================
+# One command: `docker compose up -d`
+#
+# What runs:
+#   api      — Enchilada API + Console (self-host edition, no Clerk, no SaaS)
+#              at http://localhost:${API_PORT:-3100}
+#   worker   — background ingest worker (same image as api)
+#   rag      — Python RAG engine (LightRAG + pgvector-backed graph + vector store)
+#   postgres — one pgvector container with two databases (proxy + lightrag)
+#   redis    — BullMQ queue backend
+#   minio    — S3-compatible blob store for uploaded documents
+#
+# Opt-in profiles:
+#   parser   — advanced Docling parser for scanned PDFs / Office. ~2GB image.
+#              `docker compose --profile parser up -d`
+#   ollama   — bundled local LLM + embeddings (qwen2.5:7b + nomic-embed-text)
+#              `docker compose --profile ollama up -d`
+#
+# Configuration:
+#   Copy .env.example to .env and edit. `ENCHILADA_TAG` selects the image
+#   version (defaults to the latest release this compose is pinned to).
+#
+# Upgrading:
+#   git pull && docker compose pull && docker compose up -d
+# ============================================================================
+name: enchilada-selfhost
+
+services:
+  # ---------------------------------------------------------------------------
+  # API — CORE entrypoint (Clerk-free, auto-login), serves the core web SPA.
+  # ---------------------------------------------------------------------------
+  api:
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.16.2}
+    restart: unless-stopped
+    command: ["bun", "run", "api/src/index.ts"]
+    ports:
+      - "${API_PORT:-3100}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      # Proxy state DB (accounts, api_keys, workspaces, settings, …).
+      DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_proxy
+      RAG_SERVICE_URL: http://rag:9621
+      REDIS_URL: redis://redis:6379
+      # PRD-17 parser (opt-in `parser` profile). If the parser isn't running,
+      # binary ingest fails loudly; text/markdown ingest is unaffected.
+      PARSER_URL: http://parser:9622
+      # --- Blob → MinIO (S3-compatible). blob.ts reads exactly these five
+      #     S3_* names (verified against api/src/lib/blob.ts) and is
+      #     satisfied with ZERO code change. forcePathStyle is already set in
+      #     blob.ts, which MinIO requires. ---
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: ${BLOB_BUCKET:-enchilada-blobs}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-enchilada}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-enchilada-minio}
+      # Session cookie signing secret (jose HMAC) for the built-in LocalAuth.
+      # Intentionally UNSET → auto-generated + persisted to /data/session.key on
+      # first boot (see api/src/lib/session-secret.ts), so `docker compose up`
+      # works with zero config. Set SESSION_SECRET to pin your own.
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      # ENCRYPTION_KEY intentionally UNSET → auto-generated + persisted to
+      # /data/encryption.key on first boot (see api/src/lib/encryption-key.ts).
+      ENCH_DATA_DIR: /data
+    volumes:
+      # Persists the auto-generated ENCRYPTION_KEY (and any future core state).
+      - ench-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Worker — BullMQ ingest pipeline (same image, different command).
+  # ---------------------------------------------------------------------------
+  worker:
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.16.2}
+    restart: unless-stopped
+    command: ["bun", "run", "api/src/queue/worker.ts"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_proxy
+      RAG_SERVICE_URL: http://rag:9621
+      REDIS_URL: redis://redis:6379
+      PARSER_URL: http://parser:9622
+      # Streaming Slice M — the worker base-URL seam. The chat turn worker runs the
+      # in-process MCP client here (no HTTP server bound in this container), so its
+      # enchilada_* tool calls must dial the api service over the compose network.
+      # Without this the client would fall back to localhost:3000 (nothing there)
+      # and every enchilada_query would fail → empty, ungrounded turns.
+      INTERNAL_API_URL: http://api:3000
+      S3_ENDPOINT: http://minio:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: ${BLOB_BUCKET:-enchilada-blobs}
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-enchilada}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-enchilada-minio}
+      # Unused by the worker (it signs no sessions); left unset for consistency
+      # with the api. See api/src/lib/session-secret.ts.
+      SESSION_SECRET: ${SESSION_SECRET:-}
+      ENCH_DATA_DIR: /data
+    volumes:
+      # Same volume as api → shares the persisted ENCRYPTION_KEY (worker decrypts
+      # per-workspace LLM keys). api boots first (depends_on) so the key exists.
+      - ench-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rag:
+        condition: service_started
+
+  # ---------------------------------------------------------------------------
+  # RAG engine — NetworkX graph (NO Neo4j), LightRAG store in the shared pgvector.
+  # ---------------------------------------------------------------------------
+  rag:
+    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.16.2}
+    restart: unless-stopped
+    ports:
+      - "${RAG_PORT:-9631}:9621"
+    environment:
+      RAG_ENGINE: lightrag
+      # LightRAG store lives in the SECOND DB on the shared pgvector container.
+      DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_lightrag
+      MAX_INSTANCES: "10"
+      # Per-call LLM/extraction timeout (seconds). LightRAG (lightrag-hku 1.5.4)
+      # reads LLM_TIMEOUT at construction; unset it defaults to 240s, and the first
+      # ingest on the bundled local Ollama (qwen2.5:7b on CPU) routinely exceeds
+      # that — the extraction call is killed and the ingest fails. The RAG server is
+      # plain uvicorn (no gunicorn worker timeout), so this is the effective ceiling.
+      # Raised here and overridable; lower it when using a fast hosted model.
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-900}
+      # Entity/relation extraction temperature (S17). Default 0.0 → an identical
+      # document produces a stable, reproducible graph across ingests (chat/query keep
+      # the provider default). Raise it (e.g. 0.3) ONLY if a weak local model loops
+      # during extraction — LightRAG's high default is a greedy-loop guard for
+      # Qwen3-class models, not a recall lever.
+      RAG_EXTRACT_TEMPERATURE: ${RAG_EXTRACT_TEMPERATURE:-0.0}
+      # ⭐ The datastore-collapse switch: in-process NetworkX graph, no Neo4j.
+      #    Already whitelisted (rag/engine/lightrag_engine.py:671).
+      #    Per-tenant GraphML lives under working_dir=./rag_storage/{tenant} →
+      #    mounted on the rag-storage volume below so it survives restarts.
+      GRAPH_STORAGE: NetworkXStorage
+      RAG_ADMIN_TOKEN: ${RAG_ADMIN_TOKEN:-selfhost-admin-token}
+      # Model caches (only used if the parser/OCR path pulls weights).
+      HF_HOME: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+      MINERU_MODEL_SOURCE: huggingface
+    volumes:
+      # NetworkX GraphML + any LightRAG working files (per tenant).
+      - rag-storage:/app/rag_storage
+      - mineru-models:/root/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9621/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Postgres — ONE pgvector image, TWO DBs (proxy + lightrag) via init-SQL.
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    ports:
+      - "${POSTGRES_PORT:-5442}:5432"
+    environment:
+      POSTGRES_USER: enchilada
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-enchilada}
+      # The image creates this DB; the init-SQL creates enchilada_lightrag.
+      POSTGRES_DB: enchilada_proxy
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Runs ONCE on first init (empty data dir): creates the 2nd DB + vector ext.
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Wait for BOTH DBs to exist so dependents don't race the init-SQL.
+      test: ["CMD-SHELL", "pg_isready -U enchilada -d enchilada_proxy && pg_isready -U enchilada -d enchilada_lightrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+
+  # ---------------------------------------------------------------------------
+  # Redis — BullMQ queue backend.
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6390}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # MinIO — S3-compatible blob store (satisfies blob.ts with zero code change).
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    ports:
+      - "${MINIO_API_PORT:-9010}:9000"
+      - "${MINIO_CONSOLE_PORT:-9011}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-enchilada}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-enchilada-minio}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # One-shot: create the blob bucket blob.ts expects, then exit. Uses the mc
+  # client baked into the minio image. Gated on minio being healthy; api waits
+  # for this to complete successfully so the first putBlob never 404s the bucket.
+  minio-setup:
+    image: minio/minio:latest
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "${MINIO_ROOT_USER:-enchilada}" "${MINIO_ROOT_PASSWORD:-enchilada-minio}" &&
+        mc mb --ignore-existing "local/${BLOB_BUCKET:-enchilada-blobs}" &&
+        echo "bucket ${BLOB_BUCKET:-enchilada-blobs} ready"
+
+  # ---------------------------------------------------------------------------
+  # Parser (OPT-IN upgrade) — Docling document→Markdown. ~2GB torch image. The
+  # DEFAULT stack already parses PDF + DOCX via the built-in parser baked into the
+  # api image; this service adds OCR (scanned PDFs), complex layouts/tables and the
+  # long tail of formats (pptx/xlsx/images). When running, the worker prefers it.
+  # Enable with:
+  #   docker compose -f docker/docker-compose.selfhost.yml --profile parser up
+  # ---------------------------------------------------------------------------
+  parser:
+    profiles: ["parser"]
+    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.16.2}
+    restart: unless-stopped
+    environment:
+      PARSER_PORT: "9622"
+      MAX_FILE_SIZE_MB: "100"
+      OCR_ENABLED: "false"
+      HF_HOME: /root/.cache/huggingface
+      HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
+    volumes:
+      - docling-models:/root/.cache/huggingface
+    mem_limit: 6g
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9622/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Ollama — bundled local LLM + embeddings: the zero-key, local-only default.
+  # Default model = qwen2.5:7b (~4.7 GB): small 3B models extract entities but botch
+  # LightRAG's relation format (empty-edge graph); qwen2.5:7b produces real relations.
+  # Slower on CPU — override OLLAMA_LLM_MODEL for a lighter/faster model, or use BYOK.
+  # Profile-gated (`ollama`) so BYOK users skip the model pull. The recommended
+  # first-run path is local-only:
+  #   docker compose -f docker/docker-compose.selfhost.yml --profile ollama up
+  # The setup wizard preselects Ollama at http://ollama:11434/v1 (this bundled
+  # service — NOT host.docker.internal, which is unreliable on Linux).
+  # ---------------------------------------------------------------------------
+  ollama:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # One-shot init: pull the default local models (small LLM + embedding model).
+  # Idempotent — `ollama pull` is a no-op if the model is already present.
+  #
+  # NOTE — Vision (P3.5, figure captioning for images / figure-bearing PDFs) is
+  # intentionally NOT bundled here. A local VL model (qwen2.5vl:7b ~6 GB) is
+  # impractical on the CX43-class CPU boxes this compose targets: the bundled
+  # qwen2.5:7b chat/ingest already routinely exceeds timeouts on plain text —
+  # tiled A0/A1 plan captioning through a VLM on CPU is not a real option.
+  # Two supported paths, both configured in the console UI (Settings → Models
+  # → Vision), which emits X-Vision-Model / X-Vision-Base-URL / X-Vision-API-Key
+  # to the RAG /decompose endpoint:
+  #   (a) BYOK cloud vision — point the vision role at a hosted VLM endpoint:
+  #       Mistral Pixtral (EU-sovereign, recommended for pilots), OpenAI (gpt-4o /
+  #       gpt-4o-mini), Google Gemini, or Anthropic Claude. Only the vision role
+  #       needs the cloud key; chat + embeddings can stay on local Ollama.
+  #   (b) GPU-Ollama — run a second Ollama instance on a GPU host (bare-metal,
+  #       another compose stack, or a Tailscale-reachable box), pull the VL model
+  #       there (`ollama pull qwen2.5vl:7b`), and set the vision role to that
+  #       host: base URL = http://<gpu-host>:11434/v1, model = qwen2.5vl:7b.
+  # When X-Vision-* is unset, RAG /decompose falls back to the chat model
+  # (rag/main.py) — fine when the chat model itself is a VLM; otherwise
+  # figures/images degrade to text-only handling (no captions).
+  # See docs/self-host-vision.md for the full walk-through.
+  ollama-pull:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "ollama pull ${OLLAMA_LLM_MODEL:-qwen2.5:7b} && ollama pull ${OLLAMA_EMBED_MODEL:-nomic-embed-text}"
+    restart: "no"
+
+volumes:
+  ench-data:
+  pgdata:
+  redis-data:
+  minio-data:
+  rag-storage:
+  mineru-models:
+  docling-models:
+  ollama-data:
