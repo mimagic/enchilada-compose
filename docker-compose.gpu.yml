@@ -1,0 +1,50 @@
+# Enchilada — GPU overlay for the bundled Ollama.
+# ============================================================================
+# Gives the `ollama` service NVIDIA GPU access via the standard Compose
+# `deploy.resources.reservations.devices` block. Use this whenever you plan to
+# run a vision model (e.g. qwen2.5vl:7b) or any 13B+ chat model in the
+# bundled Ollama — CPU inference on those is impractical.
+#
+# Prerequisites on the host:
+#   1. NVIDIA GPU with a recent CUDA-capable driver (see nvidia-smi).
+#   2. nvidia-container-toolkit installed AND registered as a docker runtime.
+#      Quick check:  `docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi`
+#      If that lists your GPU, you're set. If it fails, follow:
+#      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html
+#
+# Usage — combine with the base compose + the ollama profile:
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.gpu.yml \
+#     --profile ollama up -d
+#
+# After the stack is up, pull a vision model (or any heavier model) into the
+# now-GPU-backed ollama:
+#
+#   docker compose exec ollama ollama pull qwen2.5vl:7b
+#
+# Then point the Vision role at it in Settings → Models → Vision:
+#   Base URL: http://ollama:11434/v1
+#   Model:    qwen2.5vl:7b
+#
+# ----------------------------------------------------------------------------
+# NOT nvidia? See docs/self-host-vision.md — for AMD (ROCm) you want the
+# ollama/ollama:rocm image + a different device passthrough; for Apple Silicon
+# Docker cannot expose the Metal GPU to a Linux container at all (run Ollama
+# natively on macOS in that case and point X-Vision-Base-URL at the host).
+# ----------------------------------------------------------------------------
+
+services:
+  ollama:
+    # `deploy.resources.reservations.devices` is the Compose-native way to
+    # request GPU access from the container. Requires nvidia-container-toolkit
+    # on the host — docker will refuse to start the container otherwise, which
+    # is why this overlay is opt-in rather than baked into the base compose.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

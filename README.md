@@ -53,6 +53,38 @@ docker compose --profile ollama up -d
 You can also combine profiles:
 `docker compose --profile parser --profile ollama up -d`.
 
+
+## GPU support for Ollama (vision + heavier chat models)
+
+The bundled Ollama runs on CPU by default. For vision models like
+`qwen2.5vl:7b` (recommended for figure captioning during ingest) or heavier
+13B+ chat models, CPU is impractical. Enable NVIDIA GPU passthrough with the
+included overlay:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.gpu.yml \
+  --profile ollama up -d
+```
+
+Prerequisites: an NVIDIA GPU + a recent CUDA driver + `nvidia-container-toolkit`
+installed on the host. Docker refuses to start the container otherwise — that's
+why GPU is an opt-in overlay, not a base default.
+
+Once up, pull a vision model into the now-GPU-backed Ollama and wire it in:
+
+```bash
+docker compose exec ollama ollama pull qwen2.5vl:7b
+# then in Settings → Models → Vision:
+#   Base URL: http://ollama:11434/v1
+#   Model:    qwen2.5vl:7b
+```
+
+For AMD (ROCm) or Apple Silicon, see `docker-compose.gpu.yml`'s header and
+[`docs/self-host-vision.md`](docs/self-host-vision.md) — not all runtimes
+work the same way inside Docker.
+
 ## Configuration
 
 Everything is `.env`. Copy `.env.example` to `.env`; every key has a default
