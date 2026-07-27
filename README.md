@@ -68,22 +68,83 @@ docker compose \
   --profile ollama up -d
 ```
 
-Prerequisites: an NVIDIA GPU + a recent CUDA driver + `nvidia-container-toolkit`
-installed on the host. Docker refuses to start the container otherwise — that's
-why GPU is an opt-in overlay, not a base default.
+The overlay does two things:
 
-Once up, pull a vision model into the now-GPU-backed Ollama and wire it in:
+1. Grants the `ollama` service NVIDIA GPU access
+   (`deploy.resources.reservations.devices` with `driver: nvidia`).
+2. Adds a second one-shot `ollama-pull-vision` that fetches the vision model
+   (`qwen2.5vl:7b` by default; override with `OLLAMA_VISION_MODEL=…` in your
+   `.env`) once the base chat + embedding models are in — because a VL model
+   is only practical when a GPU is present.
 
-```bash
-docker compose exec ollama ollama pull qwen2.5vl:7b
-# then in Settings → Models → Vision:
-#   Base URL: http://ollama:11434/v1
-#   Model:    qwen2.5vl:7b
+Wire the vision role in **Settings → Models → Vision** after first boot:
+
+```
+Base URL: http://ollama:11434/v1
+Model:    qwen2.5vl:7b
 ```
 
-For AMD (ROCm) or Apple Silicon, see `docker-compose.gpu.yml`'s header and
-[`docs/self-host-vision.md`](docs/self-host-vision.md) — not all runtimes
-work the same way inside Docker.
+### Prerequisites
+
+- **NVIDIA GPU** with a recent CUDA-capable driver — `nvidia-smi` on the host
+  should list it.
+- **`nvidia-container-toolkit`** installed AND registered as a docker runtime.
+  Quick check:
+
+  ```bash
+  docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi
+  ```
+
+  If that lists your GPU, you're set. If it fails with
+  `could not select device driver "" with capabilities: [[gpu]]`, install the
+  toolkit: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>
+
+### VRAM sizing
+
+| Model                    | ≈ VRAM   | Runs on            |
+|--------------------------|----------|--------------------|
+| `qwen2.5vl:3b`           | ~4 GB    | 6 GB card and up   |
+| `qwen2.5vl:7b` (default) | ~7 GB    | 8 GB card and up   |
+| `llama3.2-vision:11b`    | ~10 GB   | 12 GB card and up  |
+| `qwen2.5vl:32b`          | ~24 GB   | 24 GB card and up  |
+
+Below 6 GB VRAM: skip GPU-Ollama for vision and BYOK a cloud vision key
+(Mistral Pixtral EU, GPT-4o, Gemini) in Settings → Models → Vision instead.
+
+### Verify GPU is really reaching Ollama
+
+After the stack is up, confirm the container sees the GPU:
+
+```bash
+docker compose exec ollama nvidia-smi
+```
+
+You should see a table with your GPU, driver version, and (once a model is
+loaded) a `python` or `ollama` process using VRAM. If the command errors with
+`nvidia-smi: command not found`, the container itself doesn't have the
+NVIDIA runtime — re-check the toolkit install above.
+
+### Troubleshooting
+
+- **`Error response from daemon: could not select device driver "nvidia" …`**
+  → `nvidia-container-toolkit` is missing or not registered as a docker
+  runtime. Install it (see Prerequisites) and restart the docker daemon:
+  `sudo systemctl restart docker`.
+- **`nvidia-smi` inside the container returns nothing** → the runtime is
+  registered but the container didn't request GPU access. Confirm you
+  passed `-f docker-compose.gpu.yml` on the `up` command, and verify:
+  `docker compose -f docker-compose.yml -f docker-compose.gpu.yml config
+  | grep -A5 'ollama:$' | grep nvidia`.
+- **Model loads but inference is CPU-slow** → the model file may not fit
+  VRAM and is running partly on CPU. Check GPU utilisation while a query
+  runs: `watch -n1 docker compose exec ollama nvidia-smi`. If GPU usage
+  stays near 0%, pick a smaller model (see VRAM sizing).
+- **AMD (ROCm) or Apple Silicon** → this overlay is NVIDIA-only. For ROCm
+  swap the image to `ollama/ollama:rocm` and pass `/dev/kfd` + `/dev/dri`
+  instead of the nvidia driver. Apple Silicon: Docker cannot expose the
+  Metal GPU to a Linux container at all — run Ollama natively on macOS and
+  point `X-Vision-Base-URL` at your host's `http://host.docker.internal:11434/v1`.
+  See [`docs/self-host-vision.md`](docs/self-host-vision.md).
 
 ## Configuration
 

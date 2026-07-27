@@ -48,3 +48,22 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # One-shot: pull the vision model AFTER the base ollama-pull has finished
+  # its text + embedding models. GPU is what makes a VL model practical, so
+  # this pull only makes sense when this overlay is active. Idempotent —
+  # `ollama pull` is a no-op if the model is already present. Override the
+  # model name with OLLAMA_VISION_MODEL in your .env if you prefer a different
+  # tag (e.g. `llama3.2-vision:11b`, `qwen2.5vl:32b`).
+  ollama-pull-vision:
+    profiles: ["ollama"]
+    image: ollama/ollama:latest
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - "ollama pull ${OLLAMA_VISION_MODEL:-qwen2.5vl:7b}"
+    restart: "no"
