@@ -31,7 +31,7 @@ services:
   # API — CORE entrypoint (Clerk-free, auto-login), serves the core web SPA.
   # ---------------------------------------------------------------------------
   api:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.16.2}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.18.0}
     restart: unless-stopped
     command: ["bun", "run", "api/src/index.ts"]
     ports:
@@ -84,7 +84,7 @@ services:
   # Worker — BullMQ ingest pipeline (same image, different command).
   # ---------------------------------------------------------------------------
   worker:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.16.2}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.18.0}
     restart: unless-stopped
     command: ["bun", "run", "api/src/queue/worker.ts"]
     environment:
@@ -126,7 +126,7 @@ services:
   # RAG engine — NetworkX graph (NO Neo4j), LightRAG store in the shared pgvector.
   # ---------------------------------------------------------------------------
   rag:
-    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.16.2}
+    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.18.0}
     restart: unless-stopped
     ports:
       - "${RAG_PORT:-9631}:9621"
@@ -158,6 +158,11 @@ services:
       HF_HOME: /root/.cache/huggingface
       HUGGINGFACE_HUB_CACHE: /root/.cache/huggingface/hub
       MINERU_MODEL_SOURCE: huggingface
+      # PRD-35 deterministic extractor (opt-in, default off). RAG_EXTRACT=1 makes the
+      # in-stack `extractor` sidecar (profile `deterministic`, below) the sole
+      # deterministic source per chunk — same doc, same graph. See rag/engine/extract.py.
+      RAG_EXTRACT: ${RAG_EXTRACT:-0}
+      RAG_EXTRACT_URL: ${RAG_EXTRACT_URL:-http://extractor:9640/extract}
     volumes:
       # NetworkX GraphML + any LightRAG working files (per tenant).
       - rag-storage:/app/rag_storage
@@ -173,6 +178,20 @@ services:
       start_period: 20s
 
   # ---------------------------------------------------------------------------
+  # extractor — deterministic knowledge extractor (PRD-35). Self-contained: the
+  # fine-tuned model is BAKED into the image (no download, no external call). rag calls
+  # it at /extract when RAG_EXTRACT=1. CPU single-thread greedy = byte-deterministic
+  # (same doc -> same graph). OPT-IN via the `deterministic` profile so installs that
+  # don't want it don't pay the ~4.5GB image / ~7GB RAM:
+  #   RAG_EXTRACT=1 docker compose --profile deterministic up -d
+  # amd64 image; on Apple Silicon it runs under emulation.
+  extractor:
+    profiles: ["deterministic"]
+    image: ghcr.io/mimagic/enchilada-core-extractor:${ENCHILADA_TAG:-v0.18.0}
+    restart: unless-stopped
+    ports:
+      - "${EXTRACT_PORT:-9640}:9640"
+
   # Postgres — ONE pgvector image, TWO DBs (proxy + lightrag) via init-SQL.
   # ---------------------------------------------------------------------------
   postgres:
@@ -259,7 +278,7 @@ services:
   # ---------------------------------------------------------------------------
   parser:
     profiles: ["parser"]
-    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.16.2}
+    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.18.0}
     restart: unless-stopped
     environment:
       PARSER_PORT: "9622"

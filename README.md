@@ -32,7 +32,7 @@ All Enchilada-owned images are **public**; no `docker login` required.
 
 ## Optional profiles
 
-Two features are opt-in so the base stack stays lean:
+Three features are opt-in so the base stack stays lean:
 
 **Advanced document parser** — Docling with OCR + Office support. ~2 GB image;
 needed for scanned PDFs and Word/Excel/PowerPoint. Skip if you only ingest
@@ -48,6 +48,16 @@ pulled on first boot; CPU is slow but works for a trial.
 
 ```bash
 docker compose --profile ollama up -d
+```
+
+**Deterministic knowledge extractor** — a self-contained model (baked into the image,
+no download, no external call) that makes the knowledge graph **byte-deterministic**:
+the same document always produces the same graph, independent of your LLM. Set
+`RAG_EXTRACT=1` in `.env` and start with the profile. amd64 image (~4.5 GB, needs
+~7 GB RAM; on Apple Silicon it runs under emulation).
+
+```bash
+RAG_EXTRACT=1 docker compose --profile deterministic up -d
 ```
 
 You can also combine profiles:
