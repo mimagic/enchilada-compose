@@ -29,7 +29,8 @@
 #   Model:    qwen2.5vl:7b
 #
 # ----------------------------------------------------------------------------
-# NOT nvidia? See docs/self-host-vision.md — for AMD (ROCm) you want the
+# NOT nvidia? See https://github.com/mimagic/enchilada/blob/main/docs/self-host-vision.md
+# — for AMD (ROCm) you want the
 # ollama/ollama:rocm image + a different device passthrough; for Apple Silicon
 # Docker cannot expose the Metal GPU to a Linux container at all (run Ollama
 # natively on macOS in that case and point X-Vision-Base-URL at the host).

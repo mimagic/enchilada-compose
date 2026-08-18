@@ -12,10 +12,20 @@
 #   minio    — S3-compatible blob store for uploaded documents
 #
 # Opt-in profiles:
-#   parser   — advanced Docling parser for scanned PDFs / Office. ~2GB image.
-#              `docker compose --profile parser up -d`
-#   ollama   — bundled local LLM + embeddings (qwen2.5:7b + nomic-embed-text)
-#              `docker compose --profile ollama up -d`
+#   parser        — advanced Docling parser for scanned PDFs / Office. ~2GB image.
+#                   `docker compose --profile parser up -d`
+#   ollama        — bundled local LLM + embeddings (qwen2.5:7b + nomic-embed-text)
+#                   `docker compose --profile ollama up -d`
+#   deterministic — the deterministic knowledge extractor sidecar (PRD-35).
+#                   `RAG_EXTRACT=1 docker compose --profile deterministic up -d`
+#                   Read docs/deterministic-extractor.md BEFORE running it on a
+#                   NAS-class CPU — it is minutes of CPU per chunk, not seconds.
+#
+# Network exposure:
+#   Only `api` is published on all interfaces. postgres/redis/rag/extractor/minio
+#   (+ the bundled ollama) bind to 127.0.0.1 — none of them authenticates a caller
+#   the way the api does. Override with BIND_ADDR (see .env.example) only for a
+#   network you trust.
 #
 # Configuration:
 #   Copy .env.example to .env and edit. `ENCHILADA_TAG` selects the image
@@ -43,9 +53,42 @@ services:
       DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_proxy
       RAG_SERVICE_URL: http://rag:9621
       REDIS_URL: redis://redis:6379
+      # Pipeline telemetry: the api process owns the Redis Streams consumer that
+      # reads pipeline:events:{tenant_id} and persists document_pipeline_events.
+      # Interpolated (not the literal "true" the core stack uses) so that turning
+      # the feature off from .env actually reaches the container — Compose feeds
+      # .env into VARIABLE INTERPOLATION, never into a container's environment,
+      # so a knob the compose file never names is unreachable to an operator.
+      # Keep this in sync with the rag service's copy: both sides on, or both off.
+      ENABLE_PIPELINE_TELEMETRY: ${ENABLE_PIPELINE_TELEMETRY:-true}
       # PRD-17 parser (opt-in `parser` profile). If the parser isn't running,
       # binary ingest fails loudly; text/markdown ingest is unaffected.
       PARSER_URL: http://parser:9622
+      # --- RAG-facing time budgets (ms), named by INTENT ----------------------
+      # The four values below ARE the code defaults in api/src/lib/rag-fetch.ts,
+      # which reads them at CALL time. They were unreachable from .env before —
+      # the compose files named none of them — and, worse, they were largely
+      # decoration: Bun's fetch keeps an undocumented 300s idle floor, so every
+      # budget above 300s silently aborted at 300s until rag-fetch.ts started
+      # passing `timeout: false`. Now they are real numbers, so treat them as a
+      # ladder: each one is also the time a caller (and, in the worker, a queue
+      # slot) stays occupied by one bad request.
+      # Control-plane calls with bounded server-side work: document list,
+      # job-status poll, async kickoff, admin lookups.
+      RAG_PROXY_TIMEOUT_MS: ${RAG_PROXY_TIMEOUT_MS:-120000}
+      # Answer generation. A `mode=mix` query fires two LLM calls plus
+      # embeddings, which on a local CPU model is minutes, not seconds.
+      # ⚠️ Keep this BELOW the chat surface's own CHAT_TOOL_TIMEOUT_MS (300000
+      # default): above it the api logs a ladder warning at boot and the extra
+      # budget is unreachable, because chat abandons the tool call first.
+      RAG_QUERY_TIMEOUT_MS: ${RAG_QUERY_TIMEOUT_MS:-240000}
+      # Maintenance over a whole corpus or document (re-embed, purge). Slow by
+      # nature, still bounded — an unbounded value hides a problem, not fixes it.
+      RAG_BULK_TIMEOUT_MS: ${RAG_BULK_TIMEOUT_MS:-600000}
+      # One document through extract+merge. Set on the api too, not only on the
+      # worker: ruleset import ingests from the api process. See the worker's
+      # copy below for why 900000 is a RAISE and not a cut.
+      RAG_INGEST_TIMEOUT_MS: ${RAG_INGEST_TIMEOUT_MS:-900000}
       # --- Blob → MinIO (S3-compatible). blob.ts reads exactly these five
       #     S3_* names (verified against api/src/lib/blob.ts) and is
       #     satisfied with ZERO code change. forcePathStyle is already set in
@@ -89,6 +132,12 @@ services:
     command: ["bun", "run", "api/src/queue/worker.ts"]
     environment:
       NODE_ENV: production
+      # Marks this container as the BullMQ worker so the shared api factory skips
+      # its pipeline-telemetry Redis Streams consumer (owned by the api process —
+      # running it here too would double-consume the same group). Inert today
+      # (worker.ts never builds the app factory) and deliberately set anyway: it
+      # is invisible right up until the worker gains a health endpoint.
+      ENCHILADA_ROLE: worker
       DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_proxy
       RAG_SERVICE_URL: http://rag:9621
       REDIS_URL: redis://redis:6379
@@ -108,6 +157,35 @@ services:
       # with the api. See api/src/lib/session-secret.ts.
       SESSION_SECRET: ${SESSION_SECRET:-}
       ENCH_DATA_DIR: /data
+      # --- Low-powered host knobs (defaults = the code defaults) --------------
+      # PARSER_/DECOMPOSE_TIMEOUT_MS and CHAT_WORKER_CONCURRENCY come from
+      # api/src/queue/worker.ts; the two RAG_* budgets from
+      # api/src/lib/rag-fetch.ts, which now owns every RAG-facing timeout. All
+      # of them were settable in NEITHER compose file, which is exactly the
+      # wrong way round: on a NAS-class CPU these are the first numbers to move.
+      # Ceiling on one /ingest call to the rag engine (ms). 15 min — and that is
+      # a RAISE, not a cut, even though this file used to say 1800000: the old
+      # 30 min was never reached, because Bun's 300s fetch idle floor aborted
+      # every ingest first (see api/src/lib/rag-fetch.ts). The effective ceiling
+      # went 300s -> 900s. Now that the value is real it ALSO sets worst-case
+      # worker-slot occupancy, because BullMQ retries an ingest three times
+      # (api/src/ingest/persist.ts): one permanently broken document holds a
+      # slot for 3 x 15 min = 45 min, with every other ingest queued behind it.
+      # 30 min here would have made that 90 min.
+      RAG_INGEST_TIMEOUT_MS: ${RAG_INGEST_TIMEOUT_MS:-900000}
+      # Ceiling on the worker's whole-document RAG calls — the destructive
+      # replace (DELETE /documents) rebuilds the entity/relation vector indexes,
+      # which is minutes on a weak host. Too low and the abort leaves the engine
+      # busy, so the next attempt gets 409 pipeline_busy and the document can
+      # never be replaced.
+      RAG_BULK_TIMEOUT_MS: ${RAG_BULK_TIMEOUT_MS:-600000}
+      # Ceiling on one Docling parse (ms). Scanned-PDF OCR on CPU is minutes.
+      PARSER_TIMEOUT_MS: ${PARSER_TIMEOUT_MS:-1800000}
+      # Ceiling on the /decompose poll loop (MinerU + per-figure VLM calls) (ms).
+      DECOMPOSE_TIMEOUT_MS: ${DECOMPOSE_TIMEOUT_MS:-1800000}
+      # Chat turns processed at once. Lower it to 1 on a host whose LLM is the
+      # bottleneck so a chat turn cannot starve an ingest (or vice versa).
+      CHAT_WORKER_CONCURRENCY: ${CHAT_WORKER_CONCURRENCY:-2}
     volumes:
       # Same volume as api → shares the persisted ENCRYPTION_KEY (worker decrypts
       # per-workspace LLM keys). api boots first (depends_on) so the key exists.
@@ -129,11 +207,23 @@ services:
     image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.19.0}
     restart: unless-stopped
     ports:
-      - "${RAG_PORT:-9631}:9621"
+      # Loopback-only: the rag engine's admin router is protected by nothing but a
+      # publicly documented default token. Override BIND_ADDR to expose it.
+      - "${BIND_ADDR:-127.0.0.1}:${RAG_PORT:-9631}:9621"
     environment:
       RAG_ENGINE: lightrag
       # LightRAG store lives in the SECOND DB on the shared pgvector container.
       DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_lightrag
+      # ⚠️ BOTH of the next two lines are load-bearing for BOOT, not just for
+      # telemetry. rag/ingestion/telemetry.py defaults ENABLE_PIPELINE_TELEMETRY
+      # to "true" and then RAISES if REDIS_URL is unset — inside the FastAPI
+      # lifespan, so uvicorn never serves and `restart: unless-stopped` turns it
+      # into a crash-loop. The rest of the stack still comes up (worker only waits
+      # for service_started), so the console loads and only ingest/query fail.
+      # The rag side XADDs per-phase events to pipeline:events:{tenant_id}; the
+      # api-side consumer XREADs them. Same Redis the api/worker already share.
+      REDIS_URL: redis://redis:6379
+      ENABLE_PIPELINE_TELEMETRY: ${ENABLE_PIPELINE_TELEMETRY:-true}
       MAX_INSTANCES: "10"
       # Per-call LLM/extraction timeout (seconds). LightRAG (lightrag-hku 1.5.4)
       # reads LLM_TIMEOUT at construction; unset it defaults to 240s, and the first
@@ -148,6 +238,35 @@ services:
       # during extraction — LightRAG's high default is a greedy-loop guard for
       # Qwen3-class models, not a recall lever.
       RAG_EXTRACT_TEMPERATURE: ${RAG_EXTRACT_TEMPERATURE:-0.0}
+      # --- PRD-35 determinism + claim-store control surface --------------------
+      # Every default below is a verbatim restatement of the code default, so this
+      # block is behaviour-neutral today. It exists because two of these are
+      # per-deployment POLICY (τ and the predicate vocab) that a self-hoster could
+      # otherwise only change by forking this file — and because a knob nobody can
+      # see is a knob nobody can be told to set.
+      # ⚠️ Never "tidy" a default here: RAG_DETERMINISTIC_MERGE=0 or
+      # RAG_CLAIM_VALIDATION=0 silently restores stock LightRAG's stochastic
+      # LLM description-summary merge and breaks bit-determinism fleet-wide.
+      #
+      # Deterministic merge (default ON): deterministic concat instead of the
+      # stochastic LLM summary merge, plus the content-hash description sort and
+      # fsum edge weights — identical candidates ⇒ byte-identical graph.
+      RAG_DETERMINISTIC_MERGE: ${RAG_DETERMINISTIC_MERGE:-1}
+      # L6 append-only claim store + event log (default ON): a re-import is a
+      # traceable diff (Amendment/Repeal/Correction), not a blind overwrite.
+      RAG_CLAIM_STORE: ${RAG_CLAIM_STORE:-1}
+      # L4 deterministic grounding validation (default ON): subject+object must
+      # occur in the source text. A failed claim is MARKED, never dropped.
+      RAG_CLAIM_VALIDATION: ${RAG_CLAIM_VALIDATION:-1}
+      # L7 confidence threshold τ — per-deployment POLICY, not a debug flag. Below
+      # τ a claim is labelled "conjecture" (visible + auditable), at/above it
+      # "canonical". Read-time projection: raising τ reclassifies history with no
+      # data change. Default 0.0 → all canonical (behaviour-neutral).
+      RAG_CONFIDENCE_THRESHOLD: ${RAG_CONFIDENCE_THRESHOLD:-0.0}
+      # Optional per-tenant predicate whitelist (comma-list). Empty → skipped.
+      RAG_PREDICATE_VOCAB: ${RAG_PREDICATE_VOCAB:-}
+      # The separate rule/gate L1 tier. NOT required for RAG_EXTRACT.
+      RAG_EXTRACT_LAYER1: ${RAG_EXTRACT_LAYER1:-0}
       # ⭐ The datastore-collapse switch: in-process NetworkX graph, no Neo4j.
       #    Already whitelisted (rag/engine/lightrag_engine.py:671).
       #    Per-tenant GraphML lives under working_dir=./rag_storage/{tenant} →
@@ -162,7 +281,67 @@ services:
       # in-stack `extractor` sidecar (profile `deterministic`, below) the sole
       # deterministic source per chunk — same doc, same graph. See rag/engine/extract.py.
       RAG_EXTRACT: ${RAG_EXTRACT:-0}
+      # Where the chunk is POSTed. Defaults to the in-stack sidecar. It can point
+      # at another machine ("remote extractor" mode) — but /extract has NO
+      # authentication whatsoever, so that address must never cross a network you
+      # do not control. See docs/deterministic-extractor.md.
       RAG_EXTRACT_URL: ${RAG_EXTRACT_URL:-http://extractor:9640/extract}
+      # ⚠️ THE knob for a weak host. The shipped extractor is a single-thread fp32
+      # seq2seq on CPU, measured at 83-188s per ~300-token German chunk on a NAS.
+      # Every chunk that crossed the old 120s ceiling was swallowed silently and
+      # entered the graph EMPTY — a plausible-looking but incomplete graph, on a
+      # document reported as successfully ingested.
+      # ⚠️ RETRY BUDGET, not just a timeout. Worst case per chunk is
+      #   (1 + RAG_EXTRACT_MAX_RETRIES) * RAG_EXTRACT_TIMEOUT_S + backoff
+      # and that MUST stay under LLM_TIMEOUT * 2 — LightRAG's own worker ceiling —
+      # or a WorkerTimeoutError pre-empts this client from a layer that cannot say
+      # why the chunk died, and the silent hole comes back. At the defaults:
+      # 2 * 600 + ~2s = 1202s, against a 1800s ceiling. If your host needs more
+      # than 600s per chunk, raise LLM_TIMEOUT in the same step.
+      # This one IS honoured by the v0.19.0 image (whose own default is 120s); the
+      # retry/failure settings below are not, and land with the next core release.
+      RAG_EXTRACT_TIMEOUT_S: ${RAG_EXTRACT_TIMEOUT_S:-600}
+      # Retries AFTER the first attempt, with exponential backoff (clamped 0..3).
+      # Bounded on purpose: an immediate unbounded retry doubles the offered load
+      # at exactly the moment the extractor is congested.
+      RAG_EXTRACT_MAX_RETRIES: ${RAG_EXTRACT_MAX_RETRIES:-1}
+      # fail | empty. Default `fail`: a sidecar that times out, refuses (503) or
+      # breaks FAILS the document instead of writing an empty graph and caching it.
+      # `empty` restores the pre-fix best-effort behaviour, which is what produced
+      # graphs that looked complete and were not (see
+      # docs/runbooks/repair-empty-extractions.md) — set it only if you knowingly
+      # prefer partial graphs over failed ingests.
+      RAG_EXTRACT_ON_FAILURE: ${RAG_EXTRACT_ON_FAILURE:-fail}
+      # --- Concurrency (read by LightRAG 1.5.4 itself, per tenant) -------------
+      # Chunks extracted CONCURRENTLY. LightRAG's own default is 4, which on a
+      # single-thread CPU extractor does not finish request 1 four times sooner —
+      # it makes all four finish ~4x later and cross the timeout together. 1 keeps
+      # each chunk's latency honest. Raise it IN STEP with EXTRACT_CONCURRENCY on
+      # the extractor (and only on a machine with the memory bandwidth to use it —
+      # see the sizing table in README.md). With a fast hosted LLM and
+      # RAG_EXTRACT=0, 4 is the better value.
+      EXTRACT_MAX_ASYNC_LLM: ${EXTRACT_MAX_ASYNC_LLM:-1}
+      # Embedding calls in flight per tenant (LightRAG default 8). This is the one
+      # queue ingest and query genuinely SHARE, and a query's embedding jumps it by
+      # priority — so a shallower queue is what keeps a query answering while an
+      # ingest runs. The per-role LLM queues (extract/query/keyword) are separate
+      # and do not need throttling for that.
+      EMBEDDING_FUNC_MAX_ASYNC: ${EMBEDDING_FUNC_MAX_ASYNC:-2}
+      # Fallback concurrency for LLM roles that set no {ROLE}_MAX_ASYNC_LLM of
+      # their own (query, keyword). Left at LightRAG's default: lowering it slows
+      # queries without helping ingest.
+      MAX_ASYNC_LLM: ${MAX_ASYNC_LLM:-4}
+      # Documents extracted in parallel per tenant (LightRAG default). Lower to 1
+      # on a host where one document already saturates the CPU.
+      MAX_PARALLEL_INSERT: ${MAX_PARALLEL_INSERT:-3}
+      # Deleting a document keeps its extraction cache by default, so re-ingesting
+      # byte-identical text replays the SAME extraction instead of rolling the
+      # LLM's dice again. The cost: a cached FAILED extraction also survives
+      # delete+reupload, and no UI action clears it — see
+      # docs/runbooks/repair-empty-extractions.md. Setting this to true is safe
+      # (and is the cheap repair) when RAG_EXTRACT=1, because the deterministic
+      # extractor has no dice to roll.
+      DELETE_LLM_CACHE_ON_DOC_DELETE: ${DELETE_LLM_CACHE_ON_DOC_DELETE:-false}
       # Recursive (heading-aware) chunking. Default F = unchanged 1200-token window.
       # Set RAG_CHUNK_STRATEGY=R for ~300-token chunks that fit the deterministic
       # extractor's 384-token window → the whole chunk is seen (no truncation) →
@@ -177,6 +356,13 @@ services:
       - mineru-models:/root/.cache/huggingface
     depends_on:
       postgres:
+        condition: service_healthy
+      # Parity with the core stack. NOT what fixes the crash-loop above — the
+      # telemetry client is lazy (redis.asyncio.from_url opens no socket) and the
+      # boot failure is a pure env-var presence assertion, so ordering is
+      # irrelevant today. It becomes load-bearing the day that check learns to
+      # actually ping Redis.
+      redis:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9621/health')\""]
@@ -195,10 +381,75 @@ services:
   # amd64 image; on Apple Silicon it runs under emulation.
   extractor:
     profiles: ["deterministic"]
-    image: ghcr.io/mimagic/enchilada-core-extractor:${ENCHILADA_TAG:-v0.19.0}
+    # ONE image per deployment, and one image across ALL replicas. The int8 build
+    # is numerically != fp32 and therefore has its OWN reproducible graph hash, so
+    # a mixed pool behind this service name would make the graph depend on which
+    # replica answered. int8 is also NOT recommended for German / identifier-dense
+    # corpora — see docs/deterministic-extractor.md for the measured comparison.
+    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.19.0}
     restart: unless-stopped
+    environment:
+      # Decode cap. Do NOT raise it: measured on the same chunk, 512 and 1024
+      # produce byte-identical output — the model stops on its own, so a higher cap
+      # only buys decode time when it degenerates into a loop. Lowering it is a
+      # legitimate emergency brake on a very slow host, but it CHANGES the
+      # reproducible graph hash, so treat it as a deployment-wide decision.
+      EXTRACT_MAX_NEW_TOKENS: ${EXTRACT_MAX_NEW_TOKENS:-512}
+      # --- Admission control ---------------------------------------------------
+      # The five settings below are ignored by the v0.19.0 image and take effect
+      # from the next core release. They are declared here so the knob exists
+      # before it is needed, and so an operator can find it.
+      # Requests decoded at once. `auto` = clamp(cgroup CPU quota, 1, 4). Capped
+      # because decode is memory-BANDWIDTH bound (fp32 mT5-large streams ~2.7 GB of
+      # weights per decoded token): past ~2 concurrent decodes a single-channel NAS
+      # is saturated and more workers only add latency. Beyond the queue, the server
+      # answers 503 + Retry-After rather than accepting work it cannot finish.
+      EXTRACT_CONCURRENCY: ${EXTRACT_CONCURRENCY:-auto}
+      # Requests allowed to WAIT before that 503. `auto` = 2x concurrency, and
+      # shallow on purpose: a deep queue on a bandwidth-bound host does not raise
+      # throughput, it converts a fast 503 the client can back off from into a slow
+      # client-side timeout it cannot.
+      EXTRACT_QUEUE_MAX: ${EXTRACT_QUEUE_MAX:-auto}
+      # Absolute per-request deadline (seconds). Empty = derived from the measured
+      # decode rate, which self-scales and therefore does NOT protect against a host
+      # that is uniformly slow. On such a host set it to your RAG_EXTRACT_TIMEOUT_S
+      # so the server rejects work it cannot finish instead of the client timing out.
+      EXTRACT_DEADLINE_S: ${EXTRACT_DEADLINE_S:-}
+      # ⚠️ DETERMINISM FENCE. Intra-op torch threads PER request. Above 1 the FP
+      # reduction order inside a matmul changes, so the same chunk can decode to a
+      # different block — "same document, same graph" stops being true. The server
+      # refuses to start above 1 unless the explicit opt-out below is set too. To
+      # go faster, raise EXTRACT_CONCURRENCY or add replicas; never this.
+      EXTRACT_TORCH_THREADS: ${EXTRACT_TORCH_THREADS:-1}
+      EXTRACT_ALLOW_NONDETERMINISTIC: ${EXTRACT_ALLOW_NONDETERMINISTIC:-0}
     ports:
-      - "${EXTRACT_PORT:-9640}:9640"
+      # Internal service: rag reaches it over the compose network at
+      # http://extractor:9640 and never needs a host port. Loopback-bound, and by
+      # default an EPHEMERAL host port (EXTRACT_PORT empty) so
+      # `--profile deterministic up -d --scale extractor=N` does not collide on a
+      # fixed port — Docker's embedded DNS then round-robins the `extractor` name.
+      # Find a replica's port with `docker compose port extractor 9640 --index=1`.
+      # Pin EXTRACT_PORT only for a single replica you want to curl at a fixed port.
+      - "${BIND_ADDR:-127.0.0.1}:${EXTRACT_PORT:-}:9640"
+    # An over-set EXTRACT_CONCURRENCY should OOM-kill the sidecar, not the host.
+    # ~7 GiB resident for the fp32 weights, plus ~0.35 GiB per additional in-flight
+    # request (the weights are shared) — which is why in-process concurrency is so
+    # much cheaper than replicas, each of which pays the full ~7 GiB again. The
+    # sidecar also sizes its own auto-concurrency against this limit.
+    mem_limit: ${EXTRACTOR_MEM_LIMIT:-10g}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:9640/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      # fp32 model load on a NAS-class CPU is slow, and NOTHING in this file makes
+      # rag wait for extractor health (a depends_on across an inactive profile is a
+      # portability trap). On v0.19.0, ingesting before `docker compose ps
+      # extractor` says healthy silently loses that document's chunks; from the
+      # release after v0.19.0 the engine waits out a bounded slice of the load
+      # window and then fails the document loudly, so the answer is still the
+      # same — wait for healthy, and retry anything that failed in the window.
+      start_period: 180s
 
   # Postgres — ONE pgvector image, TWO DBs (proxy + lightrag) via init-SQL.
   # ---------------------------------------------------------------------------
@@ -206,7 +457,8 @@ services:
     image: pgvector/pgvector:pg16
     restart: unless-stopped
     ports:
-      - "${POSTGRES_PORT:-5442}:5432"
+      # Loopback-only by default — see BIND_ADDR in .env.example.
+      - "${BIND_ADDR:-127.0.0.1}:${POSTGRES_PORT:-5442}:5432"
     environment:
       POSTGRES_USER: enchilada
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-enchilada}
@@ -230,7 +482,8 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
     ports:
-      - "${REDIS_PORT:-6390}:6379"
+      # Loopback-only by default — Redis here has no password at all.
+      - "${BIND_ADDR:-127.0.0.1}:${REDIS_PORT:-6390}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -247,8 +500,10 @@ services:
     restart: unless-stopped
     command: server /data --console-address ":9001"
     ports:
-      - "${MINIO_API_PORT:-9010}:9000"
-      - "${MINIO_CONSOLE_PORT:-9011}:9001"
+      # Loopback-only by default. The api/worker reach MinIO over the compose
+      # network; these publishes exist for the console + debugging.
+      - "${BIND_ADDR:-127.0.0.1}:${MINIO_API_PORT:-9010}:9000"
+      - "${BIND_ADDR:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9011}:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-enchilada}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-enchilada-minio}
@@ -320,7 +575,9 @@ services:
     image: ollama/ollama:latest
     restart: unless-stopped
     ports:
-      - "${OLLAMA_PORT:-11434}:11434"
+      # Loopback-only by default: an Ollama server accepts prompts from anyone who
+      # can reach it. Set BIND_ADDR=0.0.0.0 only on a network you control.
+      - "${BIND_ADDR:-127.0.0.1}:${OLLAMA_PORT:-11434}:11434"
     volumes:
       - ollama-data:/root/.ollama
     healthcheck:
@@ -352,7 +609,8 @@ services:
   # When X-Vision-* is unset, RAG /decompose falls back to the chat model
   # (rag/main.py) — fine when the chat model itself is a VLM; otherwise
   # figures/images degrade to text-only handling (no captions).
-  # See docs/self-host-vision.md for the full walk-through.
+  # See https://github.com/mimagic/enchilada/blob/main/docs/self-host-vision.md
+  # for the full walk-through.
   ollama-pull:
     profiles: ["ollama"]
     image: ollama/ollama:latest

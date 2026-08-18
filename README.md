@@ -60,8 +60,141 @@ the same document always produces the same graph, independent of your LLM. Set
 RAG_EXTRACT=1 docker compose --profile deterministic up -d
 ```
 
+⚠️ This tier is **CPU-bound and slow**: it decodes a model per chunk, measured at
+~85 seconds per chunk on a NAS-class CPU. Read
+[Hardware sizing](#hardware-sizing--throughput) and
+[docs/deterministic-extractor.md](docs/deterministic-extractor.md) before pointing
+it at a large corpus, and wait for `docker compose ps extractor` to report
+`healthy` before your first ingest — the model load takes minutes. On v0.19.0
+nothing blocks an ingest during that window, so a document uploaded into it is
+silently extracted as empty. From the release after v0.19.0 the engine waits out
+a bounded part of the load window instead, and a document that still fails is
+marked failed — retry it once the healthcheck is green.
+
 You can also combine profiles:
 `docker compose --profile parser --profile ollama up -d`.
+
+## Hardware sizing & throughput
+
+The base stack is modest: ~4 GB RAM and any 2-core x86-64 host runs it. What
+costs real hardware is what you switch on.
+
+| Component | RAM | CPU |
+|---|---|---|
+| base (api + worker + rag + postgres + redis + minio) | ~4 GB | 2 cores |
+| `--profile parser` (Docling) | +6 GB | OCR is CPU-heavy and bursty |
+| `--profile ollama` (qwen2.5:7b on CPU) | +6 GB | usable for a trial, slow for a corpus |
+| `--profile deterministic` (extractor) | +7 GiB (+~0.35 GiB per concurrent request) | **this is the bottleneck** |
+
+### The physics of the deterministic extractor
+
+Decoding is **memory-bandwidth bound**, not compute bound: the model streams its
+entire weight set for every token it emits — about **2.7 GB per token** in fp32
+(~1.4 GB in int8). So:
+
+```
+tokens/s  ≈  min( memory_bandwidth / bytes_per_token ,  cores × single_core_tokens/s )
+```
+
+On a single-channel NAS the first term wins by a wide margin, which is why adding
+workers there buys almost nothing. On a dual-channel desktop the second term
+starts to matter and concurrency pays off.
+
+| Host class | Memory bandwidth | Per ~300-token chunk | `EXTRACT_CONCURRENCY` | `EXTRACT_MAX_ASYNC_LLM` | Expected gain from concurrency |
+|---|---|---|---|---|---|
+| NAS-class, single-channel DDR4, 4 cores | ~7 GB/s | **~85 s (measured)** | 1–2 | 1 | ~0% — it is already saturated |
+| Desktop, dual-channel DDR4-3200, 6–8 cores | ~35–45 GB/s | ~15–25 s *(estimated)* | 4 | 4 | 3–5× |
+| Server, quad/octa-channel, 16+ cores | ~100–200 GB/s | ~5–10 s *(estimated)* | 4 per replica | 4 | scale with replicas |
+
+Only the NAS row is measured (370 ms/token → ~85 s/chunk → ~39 s per KB of source
+text, fp32, one worker). Every other cell is derived from the formula above and
+should be treated as an estimate until you measure your own box:
+
+```bash
+# the sidecar publishes an ephemeral loopback port, so ask compose for it
+EXTRACTOR=$(docker compose port extractor 9640)
+time curl -s "http://$EXTRACTOR/extract" \
+  -H 'content-type: application/json' \
+  -d '{"text":"<paste ~300 tokens of your own documents here>"}' > /dev/null
+```
+
+### What that means for a real corpus
+
+A 12 MB vault is roughly **11,000 chunks**. At the measured NAS rate that is
+about **11 days** of wall clock, and no configuration knob moves that by more
+than ~2×. That is not a defect to tune around — it is what a deterministic model
+costs on that class of hardware.
+
+If that is your situation, the honest options are, in order:
+
+1. **Run the extractor on a machine with memory bandwidth**
+   ([remote extractor mode](docs/deterministic-extractor.md#2-remote-extractor-the-answer-for-a-large-corpus)) —
+   the only option that turns days into hours.
+2. **Ingest incrementally** — the graph is useful long before the corpus is done.
+3. **Leave `RAG_EXTRACT=0`** and use an LLM for extraction. You lose byte-level
+   determinism; you keep a working system.
+
+## Network exposure
+
+Only `api` is published on all interfaces. `postgres`, `redis`, `rag`,
+`extractor`, `minio` and the bundled `ollama` bind to **127.0.0.1** — none of
+them authenticates a caller the way the api does: Redis has no password, the RAG
+admin endpoints are protected only by a documented default token, and `/extract`
+has no authentication at all.
+
+To reach them from another machine, set `BIND_ADDR` in `.env`:
+
+```dotenv
+BIND_ADDR=0.0.0.0
+```
+
+Change `POSTGRES_PASSWORD`, `MINIO_ROOT_PASSWORD` and `RAG_ADMIN_TOKEN` first,
+and prefer a private network (VLAN, Tailscale, WireGuard) over doing this on an
+interface that faces anything untrusted.
+
+## Troubleshooting
+
+**The console loads but every ingest and query fails; `docker compose ps` shows
+`rag` restarting.**
+`docker compose logs rag | head -30`. If it says
+`ENABLE_PIPELINE_TELEMETRY=true requires REDIS_URL`, you are on a compose recipe
+older than this one — `git pull` and `docker compose up -d`. (The rest of the
+stack comes up regardless, because the worker only waits for the rag container to
+*start*, not to become healthy, which is why the failure looks like an app bug
+rather than a boot failure.)
+
+**Documents ingest "successfully" but their graph is empty or very thin.**
+On v0.19.0 and earlier, an extractor timeout was swallowed and the empty result
+was cached, so re-uploading replays it. The fix ships in the release after
+v0.19.0 — check `ENCHILADA_TAG` in your `.env`, because a stack still pinned to
+v0.19.0 is still on the affected behaviour. See
+[docs/runbooks/repair-empty-extractions.md](docs/runbooks/repair-empty-extractions.md)
+— it has the diagnostic query, the purge SQL and the re-ingest procedure.
+
+**Queries hang while an ingest is running.**
+There is no lock on the query path — what starves a query is queue depth. Lower
+`EMBEDDING_FUNC_MAX_ASYNC` (the one queue ingest and query genuinely share) and
+`EXTRACT_MAX_ASYNC_LLM`, both in `.env`. The shipped defaults (2 and 1) are
+already the conservative ones.
+
+**The "Copy" buttons in the console do nothing.**
+Browsers only expose the clipboard API in a *secure context*. Reaching the
+console at `http://<nas-ip>:3100` is not one; `http://localhost:3100` is. Either
+tunnel (`ssh -L 3100:localhost:3100 user@nas`) or put a TLS-terminating reverse
+proxy in front of the api.
+
+**`DELETE /documents/{id}` returns 404.**
+That route does not exist. The endpoint is
+`DELETE /api/v1/documents?doc_id=<rag_doc_id>` — note the query parameter, and
+note that it wants the `rag_doc_id` from `GET /api/v1/documents`, not the
+document's UUID (passing the UUID returns HTTP 200 with
+`{"status":"not_found"}` and deletes nothing).
+
+**`extractor` never becomes healthy.**
+Model load is minutes on a slow CPU — the healthcheck allows 3. If it is killed
+instead, it is memory: the fp32 model needs ~7 GB and `EXTRACTOR_MEM_LIMIT`
+defaults to `10g`. Check with `docker compose logs extractor` and
+`docker inspect --format '{{.State.OOMKilled}}' $(docker compose ps -q extractor)`.
 
 
 ## GPU support for Ollama (vision + heavier chat models)
@@ -154,7 +287,7 @@ NVIDIA runtime — re-check the toolkit install above.
   instead of the nvidia driver. Apple Silicon: Docker cannot expose the
   Metal GPU to a Linux container at all — run Ollama natively on macOS and
   point `X-Vision-Base-URL` at your host's `http://host.docker.internal:11434/v1`.
-  See [`docs/self-host-vision.md`](docs/self-host-vision.md).
+  See [self-host-vision.md](https://github.com/mimagic/enchilada/blob/main/docs/self-host-vision.md).
 
 ## Configuration
 
@@ -165,6 +298,14 @@ in `docker-compose.yml`. Most people only touch `POSTGRES_PASSWORD`,
 For vision / figure captioning on scanned plans, configure the "Vision" role
 in **Settings → Models** after first boot — BYOK OpenAI / Google Gemini /
 Mistral Pixtral (EU) all work.
+
+Further reading:
+
+- [docs/deterministic-extractor.md](docs/deterministic-extractor.md) — what the
+  determinism promise covers, the three deployment shapes (in-stack, remote,
+  int8), and every extractor knob.
+- [docs/runbooks/repair-empty-extractions.md](docs/runbooks/repair-empty-extractions.md)
+  — repairing workspaces ingested with a too-tight extractor timeout.
 
 ## Upgrading
 
