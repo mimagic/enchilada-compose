@@ -67,7 +67,7 @@ RAG_EXTRACT=1 docker compose --profile deterministic up -d
 it at a large corpus, and wait for `docker compose ps extractor` to report
 `healthy` before your first ingest — the model load takes minutes. On v0.19.0
 nothing blocks an ingest during that window, so a document uploaded into it is
-silently extracted as empty. From the release after v0.19.0 the engine waits out
+silently extracted as empty. From v0.20.1 the engine waits out
 a bounded part of the load window instead, and a document that still fails is
 marked failed — retry it once the healthcheck is green.
 

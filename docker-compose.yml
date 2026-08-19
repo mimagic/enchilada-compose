@@ -41,7 +41,7 @@ services:
   # API — CORE entrypoint (Clerk-free, auto-login), serves the core web SPA.
   # ---------------------------------------------------------------------------
   api:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.19.0}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.1}
     restart: unless-stopped
     command: ["bun", "run", "api/src/index.ts"]
     ports:
@@ -127,7 +127,7 @@ services:
   # Worker — BullMQ ingest pipeline (same image, different command).
   # ---------------------------------------------------------------------------
   worker:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.19.0}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.1}
     restart: unless-stopped
     command: ["bun", "run", "api/src/queue/worker.ts"]
     environment:
@@ -204,7 +204,7 @@ services:
   # RAG engine — NetworkX graph (NO Neo4j), LightRAG store in the shared pgvector.
   # ---------------------------------------------------------------------------
   rag:
-    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.19.0}
+    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.20.1}
     restart: unless-stopped
     ports:
       # Loopback-only: the rag engine's admin router is protected by nothing but a
@@ -386,7 +386,7 @@ services:
     # a mixed pool behind this service name would make the graph depend on which
     # replica answered. int8 is also NOT recommended for German / identifier-dense
     # corpora — see docs/deterministic-extractor.md for the measured comparison.
-    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.19.0}
+    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.20.1}
     restart: unless-stopped
     environment:
       # Decode cap. Do NOT raise it: measured on the same chunk, 512 and 1024
@@ -541,7 +541,7 @@ services:
   # ---------------------------------------------------------------------------
   parser:
     profiles: ["parser"]
-    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.19.0}
+    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.20.1}
     restart: unless-stopped
     environment:
       PARSER_PORT: "9622"

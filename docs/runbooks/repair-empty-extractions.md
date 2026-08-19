@@ -101,7 +101,7 @@ slowly. In order:
    docker compose ps extractor     # must say (healthy), not (health: starting)
    ```
 
-   From the release after v0.19.0 the RAG engine waits out a *bounded* part of
+   From v0.20.1 the RAG engine waits out a *bounded* part of
    that window itself, so the first ingest you start right after
    `docker compose up -d` can simply sit there for minutes with no visible
    progress — that is the extractor loading its weights, not a hang. The wait is

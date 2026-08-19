@@ -176,7 +176,7 @@ Docker's embedded DNS then round-robins the `extractor` name. Two caveats:
 
 ## When it fails
 
-A failed extraction is loud from the release after v0.19.0: the document is
+A failed extraction is loud from v0.20.1: the document is
 marked failed rather than quietly ingested with an empty graph. On v0.19.0 and
 earlier it was silent, and the empty result was cached — if you ran that version
 on a slow host, read
