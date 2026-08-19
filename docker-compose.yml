@@ -41,7 +41,7 @@ services:
   # API — CORE entrypoint (Clerk-free, auto-login), serves the core web SPA.
   # ---------------------------------------------------------------------------
   api:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.1}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.2}
     restart: unless-stopped
     command: ["bun", "run", "api/src/index.ts"]
     ports:
@@ -127,7 +127,7 @@ services:
   # Worker — BullMQ ingest pipeline (same image, different command).
   # ---------------------------------------------------------------------------
   worker:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.1}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.2}
     restart: unless-stopped
     command: ["bun", "run", "api/src/queue/worker.ts"]
     environment:
@@ -204,7 +204,7 @@ services:
   # RAG engine — NetworkX graph (NO Neo4j), LightRAG store in the shared pgvector.
   # ---------------------------------------------------------------------------
   rag:
-    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.20.1}
+    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.20.2}
     restart: unless-stopped
     ports:
       # Loopback-only: the rag engine's admin router is protected by nothing but a
@@ -313,14 +313,25 @@ services:
       # prefer partial graphs over failed ingests.
       RAG_EXTRACT_ON_FAILURE: ${RAG_EXTRACT_ON_FAILURE:-fail}
       # --- Concurrency (read by LightRAG 1.5.4 itself, per tenant) -------------
-      # Chunks extracted CONCURRENTLY. LightRAG's own default is 4, which on a
-      # single-thread CPU extractor does not finish request 1 four times sooner —
-      # it makes all four finish ~4x later and cross the timeout together. 1 keeps
-      # each chunk's latency honest. Raise it IN STEP with EXTRACT_CONCURRENCY on
-      # the extractor (and only on a machine with the memory bandwidth to use it —
-      # see the sizing table in README.md). With a fast hosted LLM and
-      # RAG_EXTRACT=0, 4 is the better value.
-      EXTRACT_MAX_ASYNC_LLM: ${EXTRACT_MAX_ASYNC_LLM:-1}
+      # Chunks extracted CONCURRENTLY — this is the CALLER half of parallel
+      # extraction, and it has to match the sidecar or the feature does nothing.
+      #
+      # Until v0.20.1 this was 1, on the reasoning that four concurrent requests
+      # against a single-thread CPU extractor all finish ~4x later instead of one
+      # finishing sooner. That was true of the OLD sidecar: `/extract` was a sync
+      # `def`, so FastAPI ran four requests simultaneously on one core with no
+      # admission control. v0.20.1 replaced that with a real bulkhead —
+      # EXTRACT_CONCURRENCY decode slots, one torch thread each, a bounded queue
+      # and 503 + Retry-After beyond it — so N concurrent chunks now genuinely use
+      # N cores. The old value survived the rewrite and silently capped the new
+      # feature at serial: measured on a 16-core host, the same 12-chunk document
+      # took 127.8 s at 1 and 49.3 s at 4, with the extractor advertising 4.
+      #
+      # The sidecar's own EXTRACT_CONCURRENCY stays the REAL limit (it auto-sizes
+      # from cores and the container memory limit); anything above it queues there
+      # rather than piling onto the CPU, and the engine logs a warning if this
+      # number leaves decode slots idle. Raise both together on a bigger box.
+      EXTRACT_MAX_ASYNC_LLM: ${EXTRACT_MAX_ASYNC_LLM:-4}
       # Embedding calls in flight per tenant (LightRAG default 8). This is the one
       # queue ingest and query genuinely SHARE, and a query's embedding jumps it by
       # priority — so a shallower queue is what keeps a query answering while an
@@ -386,7 +397,7 @@ services:
     # a mixed pool behind this service name would make the graph depend on which
     # replica answered. int8 is also NOT recommended for German / identifier-dense
     # corpora — see docs/deterministic-extractor.md for the measured comparison.
-    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.20.1}
+    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.20.2}
     restart: unless-stopped
     environment:
       # Decode cap. Do NOT raise it: measured on the same chunk, 512 and 1024
@@ -541,7 +552,7 @@ services:
   # ---------------------------------------------------------------------------
   parser:
     profiles: ["parser"]
-    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.20.1}
+    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.20.2}
     restart: unless-stopped
     environment:
       PARSER_PORT: "9622"
