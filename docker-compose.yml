@@ -41,7 +41,7 @@ services:
   # API — CORE entrypoint (Clerk-free, auto-login), serves the core web SPA.
   # ---------------------------------------------------------------------------
   api:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.2}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.21.0}
     restart: unless-stopped
     command: ["bun", "run", "api/src/index.ts"]
     ports:
@@ -127,7 +127,7 @@ services:
   # Worker — BullMQ ingest pipeline (same image, different command).
   # ---------------------------------------------------------------------------
   worker:
-    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.20.2}
+    image: ghcr.io/mimagic/enchilada-core-api:${ENCHILADA_TAG:-v0.21.0}
     restart: unless-stopped
     command: ["bun", "run", "api/src/queue/worker.ts"]
     environment:
@@ -173,6 +173,32 @@ services:
       # slot for 3 x 15 min = 45 min, with every other ingest queued behind it.
       # 30 min here would have made that 90 min.
       RAG_INGEST_TIMEOUT_MS: ${RAG_INGEST_TIMEOUT_MS:-900000}
+      # --- Ingest lifecycle (v0.21) -------------------------------------------
+      # The worker hands a document to rag as an async JOB and polls it, instead
+      # of holding one HTTP socket open across the whole extraction. Set
+      # RAG_INGEST_ASYNC=0 to force the legacy synchronous POST — an escape hatch
+      # for a proxy that mangles 202 responses, not a version gate (the worker
+      # already DETECTS an older rag that cannot do jobs and falls back on its own).
+      RAG_INGEST_ASYNC: ${RAG_INGEST_ASYNC:-1}
+      # How often the worker asks rag how a running ingest is doing, and how long
+      # it waits in rag's admission queue before giving the slot up. Raise the poll
+      # interval on a host where a document takes hours; there is no benefit to
+      # asking every two seconds about work that takes ninety minutes.
+      RAG_INGEST_POLL_INTERVAL_MS: ${RAG_INGEST_POLL_INTERVAL_MS:-2000}
+      RAG_INGEST_QUEUE_WAIT_MS: ${RAG_INGEST_QUEUE_WAIT_MS:-600000}
+      RAG_INGEST_JOB_TIMEOUT_MS: ${RAG_INGEST_JOB_TIMEOUT_MS:-1800000}
+      # The reconciler is a periodic sweep that compares stored document status
+      # against what the engine actually holds and CORRECTS it — this is what
+      # repairs a row left 'failed' while its graph completed. It WRITES to
+      # documents.status, so it has an off switch: INGEST_RECONCILE=0 stops it and
+      # logs that it is off. Turn it off if you ever see it decide wrongly; that is
+      # a bug report, not a configuration problem.
+      INGEST_RECONCILE: ${INGEST_RECONCILE:-1}
+      INGEST_RECONCILE_INTERVAL_MS: ${INGEST_RECONCILE_INTERVAL_MS:-60000}
+      # Grace before a row is even considered — a document still being written by
+      # a live worker must never be judged by the sweep.
+      INGEST_RECONCILE_GRACE_MS: ${INGEST_RECONCILE_GRACE_MS:-120000}
+      INGEST_RECONCILE_LOOKBACK_MS: ${INGEST_RECONCILE_LOOKBACK_MS:-86400000}
       # Ceiling on the worker's whole-document RAG calls — the destructive
       # replace (DELETE /documents) rebuilds the entity/relation vector indexes,
       # which is minutes on a weak host. Too low and the abort leaves the engine
@@ -204,7 +230,7 @@ services:
   # RAG engine — NetworkX graph (NO Neo4j), LightRAG store in the shared pgvector.
   # ---------------------------------------------------------------------------
   rag:
-    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.20.2}
+    image: ghcr.io/mimagic/enchilada-core-rag:${ENCHILADA_TAG:-v0.21.0}
     restart: unless-stopped
     ports:
       # Loopback-only: the rag engine's admin router is protected by nothing but a
@@ -292,6 +318,27 @@ services:
       # entered the graph EMPTY — a plausible-looking but incomplete graph, on a
       # document reported as successfully ingested.
       # ⚠️ RETRY BUDGET, not just a timeout. Worst case per chunk is
+      # --- Ingest admission + job store (v0.21) -------------------------------
+      # Same-tenant inserts are SERIALISED (that is a determinism guarantee, not a
+      # performance accident). Before this, extra requests parked on that lock with
+      # no bound and no feedback, so a caller could not tell "being processed" from
+      # "seventh in an invisible queue" — it timed out on queue time and reported a
+      # processing failure. Now the queue is bounded and anything beyond it gets an
+      # immediate 429 + Retry-After, which the worker treats as "queued, wait".
+      RAG_INSERT_QUEUE_MAX: ${RAG_INSERT_QUEUE_MAX:-4}
+      RAG_INSERT_QUEUE_RETRY_AFTER_S: ${RAG_INSERT_QUEUE_RETRY_AFTER_S:-30}
+      # Async ingest jobs are kept in memory, bounded by age and count. They are
+      # deliberately NOT persisted: the work a job describes is a task in THIS
+      # process, so a restart kills it — a persisted record would outlive the only
+      # thing that could finish it and answer 'running' forever, which is a worse
+      # lie than forgetting. The worker treats a 404 as "rag restarted, reconcile".
+      RAG_INGEST_JOB_TTL_S: ${RAG_INGEST_JOB_TTL_S:-3600}
+      RAG_INGEST_JOB_MAX: ${RAG_INGEST_JOB_MAX:-512}
+      # Upper bound a caller may request from GET /documents. The default is high
+      # enough that a caller which ignores paging still gets a whole realistic
+      # workspace rather than a silent prefix — a truncated list that LOOKS complete
+      # is how a document gets judged missing and destructively re-ingested.
+      RAG_DOCUMENTS_PAGE_SIZE_MAX: ${RAG_DOCUMENTS_PAGE_SIZE_MAX:-1000}
       #   (1 + RAG_EXTRACT_MAX_RETRIES) * RAG_EXTRACT_TIMEOUT_S + backoff
       # and that MUST stay under LLM_TIMEOUT * 2 — LightRAG's own worker ceiling —
       # or a WorkerTimeoutError pre-empts this client from a layer that cannot say
@@ -397,7 +444,7 @@ services:
     # a mixed pool behind this service name would make the graph depend on which
     # replica answered. int8 is also NOT recommended for German / identifier-dense
     # corpora — see docs/deterministic-extractor.md for the measured comparison.
-    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.20.2}
+    image: ${EXTRACTOR_IMAGE:-ghcr.io/mimagic/enchilada-core-extractor}:${ENCHILADA_TAG:-v0.21.0}
     restart: unless-stopped
     environment:
       # Decode cap. Do NOT raise it: measured on the same chunk, 512 and 1024
@@ -552,7 +599,7 @@ services:
   # ---------------------------------------------------------------------------
   parser:
     profiles: ["parser"]
-    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.20.2}
+    image: ghcr.io/mimagic/enchilada-core-parser:${ENCHILADA_TAG:-v0.21.0}
     restart: unless-stopped
     environment:
       PARSER_PORT: "9622"
