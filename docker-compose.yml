@@ -53,6 +53,33 @@ services:
       DATABASE_URL: postgresql://enchilada:${POSTGRES_PASSWORD:-enchilada}@postgres:5432/enchilada_proxy
       RAG_SERVICE_URL: http://rag:9621
       REDIS_URL: redis://redis:6379
+      # --- Per-role provider passthrough (`extra_body`) -----------------------
+      # Provider-specific request fields the OpenAI-compatible schema has no name
+      # for, per model role, as raw JSON. Named here because a knob this file never
+      # names is unreachable to an operator: Compose feeds .env into VARIABLE
+      # INTERPOLATION, never into a container's environment.
+      #
+      # The proxy validates each value once per process and forwards it as an
+      # X-*-Extra-Body header. A rejected value is dropped from the request but
+      # REPORTED by GET /settings, never silently ignored. Sampler fields are
+      # refused outright on the extraction role — they would un-pin reproducibility.
+      #
+      # The case this exists for: switching reasoning OFF during extraction on a
+      # GPT-5-class hosted model. Reasoning buys nothing for entity extraction and
+      # costs the large majority of the output tokens:
+      #   ENCH_EXTRA_BODY_EXTRACT={"reasoning_effort":"none"}
+      # A local reasoning model usually wants chat_template_kwargs instead.
+      #
+      # Empty = NOT CONFIGURED, and the request goes out byte-identical to what it
+      # was before this field existed (determinism contract C5).
+      #
+      # There is deliberately no EMBEDDING entry: LightRAG 1.5.4's openai_embed()
+      # takes a fixed parameter list with no **kwargs, so the engine REFUSES that
+      # role and publishes the refusal on GET /health. Naming a knob here that
+      # provably cannot reach a provider is the failure this feature exists to remove.
+      ENCH_EXTRA_BODY_CHAT: ${ENCH_EXTRA_BODY_CHAT:-}
+      ENCH_EXTRA_BODY_EXTRACT: ${ENCH_EXTRA_BODY_EXTRACT:-}
+      ENCH_EXTRA_BODY_VISION: ${ENCH_EXTRA_BODY_VISION:-}
       # Pipeline telemetry: the api process owns the Redis Streams consumer that
       # reads pipeline:events:{tenant_id} and persists document_pipeline_events.
       # Interpolated (not the literal "true" the core stack uses) so that turning
@@ -142,6 +169,13 @@ services:
       RAG_SERVICE_URL: http://rag:9621
       REDIS_URL: redis://redis:6379
       PARSER_URL: http://parser:9622
+      # Per-role provider passthrough — see the api service for the full note.
+      # Set here TOO and not only on api: the ingest pipeline (and with it every
+      # extraction call) runs in THIS container, so ENCH_EXTRA_BODY_EXTRACT on the
+      # api service alone would leave the one role it exists for unconfigured.
+      ENCH_EXTRA_BODY_CHAT: ${ENCH_EXTRA_BODY_CHAT:-}
+      ENCH_EXTRA_BODY_EXTRACT: ${ENCH_EXTRA_BODY_EXTRACT:-}
+      ENCH_EXTRA_BODY_VISION: ${ENCH_EXTRA_BODY_VISION:-}
       # Streaming Slice M — the worker base-URL seam. The chat turn worker runs the
       # in-process MCP client here (no HTTP server bound in this container), so its
       # enchilada_* tool calls must dial the api service over the compose network.
@@ -263,7 +297,40 @@ services:
       # the provider default). Raise it (e.g. 0.3) ONLY if a weak local model loops
       # during extraction — LightRAG's high default is a greedy-loop guard for
       # Qwen3-class models, not a recall lever.
+      #
+      # `none` OMITS the parameter from the request entirely (proven by
+      # rag/tests/test_extract_temperature.py). Use it for a model family that
+      # REFUSES an explicit temperature: the GPT-5.x reasoning models answer
+      # 400 unsupported_value to any value but their own. Setting 1.0 to satisfy
+      # such a provider silently gives up reproducibility — `none` does not, because
+      # the seed stays pinned and the provider applies one fixed default. That is as
+      # reproducible as a hosted model gets, and strictly better than forcing 1.0.
       RAG_EXTRACT_TEMPERATURE: ${RAG_EXTRACT_TEMPERATURE:-0.0}
+      # --- Per-role provider passthrough, engine-side fallback ----------------
+      # Same feature as ENCH_EXTRA_BODY_<ROLE> on the api/worker services, applied
+      # when no request header carries one (admin routes, scripts, direct calls).
+      # The header path WINS when both are set (rag/engine/llm_roles.py:333).
+      # Raw JSON, e.g. RAG_EXTRACT_EXTRA_BODY={"reasoning_effort":"none"}.
+      # No EMBEDDING entry, for the same reason as on the api service: the engine
+      # refuses that role because openai_embed() takes no **kwargs.
+      RAG_CHAT_EXTRA_BODY: ${RAG_CHAT_EXTRA_BODY:-}
+      RAG_EXTRACT_EXTRA_BODY: ${RAG_EXTRACT_EXTRA_BODY:-}
+      RAG_VISION_EXTRA_BODY: ${RAG_VISION_EXTRA_BODY:-}
+      # --- Retrieval width (LightRAG's own env, adopted here) -----------------
+      # Read once at import time by the pinned LightRAG 1.5.4
+      # (lightrag/base.py:107-126). Every default below is a VERBATIM restatement
+      # of that code default, so this block is behaviour-neutral today. Named here
+      # because they were never adopted and never documented: an operator paying per
+      # input token had no way to reach them short of forking this file.
+      #
+      # They shape the CONTEXT ASSEMBLED FOR AN ANSWER, not what is stored. Lowering
+      # them makes answers cheaper and narrower and does NOT change the knowledge
+      # graph a document produced — the determinism guarantee is untouched.
+      TOP_K: ${TOP_K:-40}
+      CHUNK_TOP_K: ${CHUNK_TOP_K:-20}
+      MAX_ENTITY_TOKENS: ${MAX_ENTITY_TOKENS:-6000}
+      MAX_RELATION_TOKENS: ${MAX_RELATION_TOKENS:-8000}
+      MAX_TOTAL_TOKENS: ${MAX_TOTAL_TOKENS:-30000}
       # --- PRD-35 determinism + claim-store control surface --------------------
       # Every default below is a verbatim restatement of the code default, so this
       # block is behaviour-neutral today. It exists because two of these are

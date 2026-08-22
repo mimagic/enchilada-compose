@@ -299,6 +299,47 @@ For vision / figure captioning on scanned plans, configure the "Vision" role
 in **Settings → Models** after first boot — BYOK OpenAI / Google Gemini /
 Mistral Pixtral (EU) all work.
 
+### Hosted providers: Azure AI Foundry and the GPT-5.x family
+
+Two things trip up almost every first Azure deployment.
+
+**The base URL needs the `/openai/v1` suffix.** Foundry's portal shows you an
+endpoint like `https://<resource>.services.ai.azure.com`, which is not an
+OpenAI-compatible base URL. Enter it in **Settings → Models** as:
+
+```
+https://<resource>.services.ai.azure.com/openai/v1
+```
+
+The model name is your *deployment* name, not the catalogue name.
+
+**GPT-5.x refuses an explicit `temperature`.** These models answer
+`400 unsupported_value` to any temperature but their own default, and extraction
+sends one on purpose to keep the graph reproducible. Do **not** work around it by
+setting `1.0` — that trades away reproducibility silently. Omit the field instead:
+
+```bash
+RAG_EXTRACT_TEMPERATURE=none
+```
+
+While you are there, switch reasoning off for extraction. It buys nothing for
+entity extraction and costs the large majority of the output tokens — in a field
+test, ~78% fewer output tokens and ~4.6x lower latency:
+
+```bash
+ENCH_EXTRA_BODY_EXTRACT={"reasoning_effort":"none"}
+RAG_EXTRACT_EXTRA_BODY={"reasoning_effort":"none"}
+```
+
+This one only pays off when extraction goes through an LLM (`RAG_EXTRACT=0`,
+which is the shape an Azure-only deployment has). If you run the deterministic
+extractor (`RAG_EXTRACT=1`), extraction never calls an LLM for that role — the
+engine accepts the value and logs it as inert rather than pretending it helped.
+
+If a hosted model's query bill surprises you, the `TOP_K` / `MAX_*_TOKENS` block
+in `.env.example` is the width of the context assembled per answer. Lowering it
+changes answers, never the stored graph.
+
 Further reading:
 
 - [docs/deterministic-extractor.md](docs/deterministic-extractor.md) — what the
