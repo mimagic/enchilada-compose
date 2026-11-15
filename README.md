@@ -362,14 +362,11 @@ database migrations run automatically on API start.
 
 ## License
 
-This deployment recipe is distributed under the same
-**Enchilada Proprietary Source-Available License** as the product itself
-(see [LICENSE](LICENSE)). In short: **free for personal / evaluation use;
-commercial use → talk to sales.** Redistribution and offering Enchilada as a
-hosted service to third parties are not permitted without an agreement.
+[Apache License 2.0](LICENSE) — the same license as the Enchilada core. Use it,
+change it, redistribute it, run it commercially. See [NOTICE](NOTICE).
+"Enchilada" is a trademark of MiMagic GmbH; the license grants no trademark rights.
 
 ## Support
 
 - Product source, roadmap, releases: <https://github.com/mimagic/enchilada>
 - Deployment issues, questions, requests: file them here.
-- Commercial licensing / pilots: reach out via your Enchilada contact.

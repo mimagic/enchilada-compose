@@ -1,0 +1,11 @@
+Enchilada — Self-Host
+Copyright 2026 MiMagic GmbH
+
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This repository contains the docker-compose deployment recipe and its
+documentation. The container images it references are distributed under their
+own licenses; the Enchilada core images ship with their own LICENSE and NOTICE.
+
+"Enchilada" and "MiMagic" are trademarks of MiMagic GmbH. The Apache-2.0
+license grants no trademark rights (§6).
